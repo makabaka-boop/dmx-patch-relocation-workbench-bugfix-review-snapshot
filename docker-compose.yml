@@ -1,0 +1,14 @@
+# WEB_PORT 可覆盖：WEB_PORT=9000 docker compose up --build web
+services:
+  web:
+    build:
+      context: .
+      target: web
+    ports:
+      - "${WEB_PORT:-8080}:80"
+
+  # 验收服务：docker compose run --rm verify
+  verify:
+    build:
+      context: .
+      target: verify
