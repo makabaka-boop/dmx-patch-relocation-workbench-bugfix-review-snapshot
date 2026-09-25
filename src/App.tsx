@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, ReactNode, useState } from "react";
+import { ChangeEvent, FormEvent, ReactNode, useRef, useState } from "react";
 import {
   ConflictGroup,
   Fixture,
@@ -91,10 +91,18 @@ export default function App() {
   const [reviewError, setReviewError] = useState<ReviewInputError | null>(null);
   const [reviewBaseline, setReviewBaseline] = useState<Fixture[]>([]);
 
+  // 工程修订号：基线替换（导入/演示）、试调提交、候选或基线文件重选都会使其递增。
+  // 文件读取是异步的；读取完成后仅当修订号未变——即结果仍对应当前选中文件与
+  // 当前基线修订——才允许落地；迟到的读取（含失败）一律静默丢弃，绝不把过期
+  // 预览、过期错误或过期基线快照写回界面。
+  const revisionRef = useRef(0);
+
   const selected: Fixture | null =
     engine && selectedId ? engine.getFixture(selectedId) ?? null : null;
 
   function loadPatch(fixtures: Fixture[]) {
+    // 基线整体替换：推进修订号，作废旧基线上一切未完成的文件读取
+    revisionRef.current += 1;
     const eng = new PatchEngine(fixtures);
     const g = eng.getGroups();
     setEngine(eng);
@@ -122,16 +130,23 @@ export default function App() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
+    // 连续选择基线文件时只有最后选择的有效；读取期间落地的其他工程变更
+    // （试调提交、候选重选等）同样使本读取过期
+    revisionRef.current += 1;
+    const revision = revisionRef.current;
+    let parsed: Fixture[] | null = null;
     try {
-      const parsed = parsePatch(JSON.parse(await file.text()));
-      if (!parsed) {
-        failImport();
-        return;
-      }
-      loadPatch(parsed);
+      parsed = parsePatch(JSON.parse(await file.text()));
     } catch {
-      failImport();
+      parsed = null;
     }
+    // 迟到读取：已有更新的选择或工程变更，静默丢弃（含失败结果）
+    if (revisionRef.current !== revision) return;
+    if (!parsed) {
+      failImport();
+      return;
+    }
+    loadPatch(parsed);
   }
 
   function selectFixture(id: string) {
@@ -189,7 +204,9 @@ export default function App() {
     setUniInput(String(r.targetUniverse));
     setStartInput(String(r.targetStart));
     setTrial(engine.trialMove(selectedId, r.targetUniverse, r.targetStart));
-    // 引擎补丁被改写：旧复核结论针对的是旧基线快照，立即撤销
+    // 引擎补丁被改写：旧复核结论针对的是旧基线快照，立即撤销；
+    // 同时推进修订号——任何迟到的候选读取都不得把试调前的基线放回审核区
+    revisionRef.current += 1;
     setReview(null);
     setReviewError(null);
     setReviewBaseline([]);
@@ -224,23 +241,31 @@ export default function App() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file || !engine) return;
-    // 重新选择补丁：先立即撤销任何旧结论
+    // 重新选择候选：立即撤销旧结论（含旧基线快照），并推进修订号，
+    // 使此前任何候选的迟到读取（含失败）都不再落地
+    revisionRef.current += 1;
+    const revision = revisionRef.current;
     setReview(null);
     setReviewError(null);
-    const baseline = engine.exportFixtures();
+    setReviewBaseline([]);
+    const eng = engine;
+    const baseline = eng.exportFixtures();
     let text: string;
     try {
       text = await file.text();
     } catch {
-      setReviewError("READ_FAILED");
-      setReviewBaseline([]);
+      // 读取失败：仅当本候选仍是当前选择时才报告；否则静默丢弃
+      if (revisionRef.current === revision) setReviewError("READ_FAILED");
       return;
     }
-    const result = reviewFromText(text, baseline, engine);
+    // 读取期间若发生候选重选、试调提交或基线重导入，修订号已变：
+    // 本结果针对的是旧文件或旧基线，必须丢弃——不得覆盖当前结论，
+    // 不得恢复旧结论，也不得在新工程上留下过期审核。
+    if (revisionRef.current !== revision) return;
+    const result = reviewFromText(text, baseline, eng);
     if (result.error) {
-      // 读取/校验/求解失败：恢复基线、清空候选
+      // 校验/求解失败：恢复基线展示、清空候选
       setReviewError(result.error);
-      setReviewBaseline([]);
       return;
     }
     setReview(result.resolution);
