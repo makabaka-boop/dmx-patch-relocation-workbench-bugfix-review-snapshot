@@ -1,4 +1,4 @@
-import { ChangeEvent, FormEvent, ReactNode, useState } from "react";
+import { ChangeEvent, FormEvent, ReactNode, useRef, useState } from "react";
 import {
   ConflictGroup,
   Fixture,
@@ -90,6 +90,11 @@ export default function App() {
   const [review, setReview] = useState<ReviewResolution | null>(null);
   const [reviewError, setReviewError] = useState<ReviewInputError | null>(null);
   const [reviewBaseline, setReviewBaseline] = useState<Fixture[]>([]);
+  // 复核会话序号（ref，同步递增、不参与渲染）：每次选择候选、提交试移或
+  // 重导基线都会 +1。候选读取是异步的，迟到完成的旧读取（连同其旧基线
+  // 快照）凭序号比对整体丢弃——不得覆盖更新的候选结论，也不得把试移提交
+  // 或基线重导入之前的审核状态重新放进审核区。
+  const reviewSeq = useRef(0);
 
   const selected: Fixture | null =
     engine && selectedId ? engine.getFixture(selectedId) ?? null : null;
@@ -106,7 +111,8 @@ export default function App() {
     setTrial(null);
     setLookup("");
     setCap(200);
-    // 基线被整体替换：撤销任何既有复核结论与候选
+    // 基线被整体替换：撤销任何既有复核结论与候选，并使在途候选读取失效
+    reviewSeq.current += 1;
     setReview(null);
     setReviewError(null);
     setReviewBaseline([]);
@@ -189,7 +195,9 @@ export default function App() {
     setUniInput(String(r.targetUniverse));
     setStartInput(String(r.targetStart));
     setTrial(engine.trialMove(selectedId, r.targetUniverse, r.targetStart));
-    // 引擎补丁被改写：旧复核结论针对的是旧基线快照，立即撤销
+    // 引擎补丁被改写：旧复核结论针对的是旧基线快照，立即撤销；
+    // 同时使在途候选读取失效——迟到完成不得把试移前的基线重新放进审核区
+    reviewSeq.current += 1;
     setReview(null);
     setReviewError(null);
     setReviewBaseline([]);
@@ -224,7 +232,9 @@ export default function App() {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file || !engine) return;
-    // 重新选择补丁：先立即撤销任何旧结论
+    // 重新选择补丁：开启新会话并立即撤销任何旧结论；
+    // 此后迟到完成的旧读取（无论成功或失败）都会因序号过期被整体丢弃
+    const seq = ++reviewSeq.current;
     setReview(null);
     setReviewError(null);
     const baseline = engine.exportFixtures();
@@ -232,10 +242,16 @@ export default function App() {
     try {
       text = await file.text();
     } catch {
-      setReviewError("READ_FAILED");
-      setReviewBaseline([]);
+      // 读取失败：仅当前会话才清空候选并展示失败；过期会话的失败一律忽略
+      if (seq === reviewSeq.current) {
+        setReviewError("READ_FAILED");
+        setReviewBaseline([]);
+      }
       return;
     }
+    // 读取期间发生了重选候选、试移提交或基线重导入：
+    // 本结果对应的是旧候选或旧基线修订，整体丢弃（不求解、不写回）
+    if (seq !== reviewSeq.current) return;
     const result = reviewFromText(text, baseline, engine);
     if (result.error) {
       // 读取/校验/求解失败：恢复基线、清空候选
